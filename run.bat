@@ -17,6 +17,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem No args: launch GUI (prefer pythonw.exe to avoid an extra console window); with args: CLI mode
+if not "%~1"=="" goto cli
+
+set "GUI_EXE="
+if exist "%~dp0.venv\Scripts\pythonw.exe" (
+    set "GUI_EXE=%~dp0.venv\Scripts\pythonw.exe"
+) else (
+    for %%X in (pythonw.exe) do if not defined GUI_EXE if not "%%~$PATH:X"=="" set "GUI_EXE=%%~$PATH:X"
+)
+if not defined GUI_EXE set "GUI_EXE=%PY_EXE%"
+start "" "%GUI_EXE%" "%~dp0gui.py"
+exit /b 0
+
+:cli
 "%PY_EXE%" "%~dp0main.py" %*
 
 echo.
