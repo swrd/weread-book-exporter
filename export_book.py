@@ -229,8 +229,8 @@ def build_markdown_files(book_id, title, texts):
     with open(pure_md_path, "w", encoding="utf-8") as f:
         f.write("\n\n---\n\n".join(pure_chaps))
 
-    print(f"📄 Markdown 笔记生成完成:\n  - {pure_md_path}", flush=True)
-    return pure_md_path
+    print(f"📄 Markdown 笔记生成完成:\n  - {html_md_path}\n  - {pure_md_path}", flush=True)
+    return html_md_path, pure_md_path
 
 
 def build_epub(book_id, root, title, author, texts):
@@ -495,6 +495,86 @@ p.yw {{
     return pdf_path
 
 
+def verify_exports(root, texts, outputs):
+    """导出后置校验：产物文件完整性 / 图片引用 / 章节数对账 / 内容回读一致。仅告警，不阻塞。"""
+    print("\n🔍 导出后置校验...", flush=True)
+    problems, notes = [], []
+
+    # 1. 产物文件存在性与大小合理性
+    for label, path, min_kb in (
+        ("HTML排版MD", outputs.get("md_html"), 1),
+        ("纯Markdown", outputs.get("md_pure"), 1),
+        ("EPUB", outputs.get("epub"), 5),
+        ("PDF", outputs.get("pdf"), 10),
+    ):
+        if label == "EPUB" and not path:
+            notes.append("EPUB 未生成（未安装 markdown/EbookLib，属可选跳过）")
+            continue
+        if not path or not os.path.isfile(path):
+            problems.append(f"{label}: 产物文件缺失: {path}")
+        elif os.path.getsize(path) < min_kb * 1024:
+            problems.append(f"{label}: 文件异常偏小 ({os.path.getsize(path) / 1024:.1f} KB)，可能生成失败")
+
+    # 2. EPUB 包完整性（zip 结构 + CRC 校验）
+    epub_path = outputs.get("epub")
+    if epub_path and os.path.isfile(epub_path):
+        try:
+            import zipfile
+            with zipfile.ZipFile(epub_path) as z:
+                if "mimetype" not in z.namelist():
+                    problems.append("EPUB: 缺少 mimetype 部件，包结构异常")
+                bad = z.testzip()
+                if bad:
+                    problems.append(f"EPUB: 内部文件损坏: {bad}")
+        except Exception as e:
+            problems.append(f"EPUB: 无法解析（{e}）")
+
+    # 3. PDF 文件头有效性
+    pdf_path = outputs.get("pdf")
+    if pdf_path and os.path.isfile(pdf_path):
+        try:
+            with open(pdf_path, "rb") as f:
+                if f.read(5) != b"%PDF-":
+                    problems.append("PDF: 文件头异常，不是有效的 PDF")
+        except Exception as e:
+            problems.append(f"PDF: 无法读取（{e}）")
+
+    # 4~6. 纯 Markdown：图片引用完整性 / 章节数对账 / 内容回读一致
+    pure_path = outputs.get("md_pure")
+    if pure_path and os.path.isfile(pure_path):
+        with open(pure_path, encoding="utf-8") as f:
+            content = f.read()
+
+        refs = set(re.findall(r"!\[[^\]]*\]\((images/[^)]+)\)", content))
+        missing = sorted(r for r in refs if not os.path.isfile(os.path.join(root, r)))
+        if missing:
+            problems.append(f"Markdown 引用的 {len(missing)} 张插图在本地缺失（抓取时未下载成功），例如: {missing[:3]}")
+
+        n_out = len(re.findall(r"(?m)^#\s+", content))
+        if n_out != len(texts):
+            problems.append(f"章节数不一致: 导出文件中 {n_out} 章 vs 源数据 {len(texts)} 章")
+
+        refined = [refine_chapter_text(t) for t in texts]
+        exp_pure = "\n\n---\n\n".join(
+            re.sub(r'<p class="fang">(.*?)</p>', r'> *\1*',
+                   re.sub(r'<p class="yw">(.*?)</p>', r'> **\1**', t))
+            for t in refined
+        )
+        if content != exp_pure:
+            problems.append("导出文件内容与期望生成结果不一致（写入可能被中断或文件被占用）")
+
+    if problems:
+        print(f"⚠️ 后置校验发现 {len(problems)} 个问题：", flush=True)
+        for p in problems:
+            print(f"   - {p}", flush=True)
+        print("   （告警不阻塞；请根据提示检查 output/ 产物，必要时重新导出）", flush=True)
+    else:
+        print("✅ 后置校验通过：产物文件完整、插图引用齐全、章节数一致。", flush=True)
+    for n in notes:
+        print(f"ℹ {n}", flush=True)
+    return problems
+
+
 async def main(book_id_or_url):
     book_id = extract_book_id(book_id_or_url)
     if not book_id:
@@ -520,9 +600,13 @@ async def main(book_id_or_url):
             intro = m.get("intro", "")
 
     print(f"\n📦 开始导出全格式电子书: 《{title}》")
-    build_markdown_files(book_id, title, texts)
-    build_epub(book_id, root, title, author, texts)
-    await build_pdf(book_id, root, title, author, intro, texts)
+    md_html, md_pure = build_markdown_files(book_id, title, texts)
+    epub_path = build_epub(book_id, root, title, author, texts)
+    pdf_path = await build_pdf(book_id, root, title, author, intro, texts)
+
+    # 导出后置校验：产物文件完整性 / 图片引用 / 章节数对账（仅告警，不阻塞）
+    verify_exports(root, texts, {"md_html": md_html, "md_pure": md_pure, "epub": epub_path, "pdf": pdf_path})
+
     print(f"\n🎉 恭喜！全格式电子书已生成完毕，保存在: output/ 目录\n")
     return True
 
