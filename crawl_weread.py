@@ -36,6 +36,55 @@ USER_DATA_DIR = os.environ.get("WEREAD_PROFILE", os.path.join(BASE, "cache", "br
 PAGE_DELAY_RANGE = (8.0, 20.0)       # 每次翻页后的随机等待（秒）
 LONG_PAUSE_EVERY = (10, 20)          # 每隔 10~20 页触发一次长停顿
 LONG_PAUSE_RANGE = (60.0, 120.0)     # 长停顿时长（秒）
+STALE_LIMIT = 12                     # 连续 N 页无新内容才判定全书完结（防弹窗/网络抖动误判截断）
+LOGIN_CHECK_EVERY = 15               # 每抓 N 页复查一次登录态，掉登录立即如实终止
+
+
+def clear_crawl_artifacts(book_dir):
+    """清空历史抓取产物（章节 md / 逐页与章节 json / 状态文件），保留 meta.json 与封面，用于全新重抓"""
+    removed = 0
+    md_dir = os.path.join(book_dir, "chapters")
+    raw_dir = os.path.join(book_dir, "raw")
+    if os.path.isdir(md_dir):
+        targets = [os.path.join(md_dir, f) for f in os.listdir(md_dir) if f.endswith(".md")]
+    else:
+        targets = []
+    if os.path.isdir(raw_dir):
+        targets += [os.path.join(raw_dir, f) for f in os.listdir(raw_dir)
+                    if (f.startswith("page_") or f.startswith("chap_")) and f.endswith(".json")]
+    sf = os.path.join(book_dir, "_state.json")
+    if os.path.exists(sf):
+        targets.append(sf)
+    for fp in targets:
+        try:
+            os.remove(fp)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def load_chapter_titles(raw_dir):
+    """读取已落盘章节标题，返回 (完整章节列表, 部分章节列表)。
+
+    上次异常终止时“末章落盘”的章节带 partial 标记，内容可能不完整，
+    断点续传时不计入已完成章节，避免残缺内容被当作已抓完复用。
+    """
+    completed, partials = [], []
+    if not os.path.isdir(raw_dir):
+        return completed, partials
+    for cf in sorted(os.listdir(raw_dir)):
+        if not (cf.startswith("chap_") and cf.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(raw_dir, cf), encoding="utf-8") as f:
+                cdata = json.load(f)
+            if not cdata.get("title"):
+                continue
+            (partials if cdata.get("partial") else completed).append(cdata["title"])
+        except Exception:
+            pass
+    return completed, partials
 
 
 def next_long_pause_at(step):
@@ -521,6 +570,14 @@ async def main(book_id_or_url, force=False):
     existing_mds = sorted([f for f in os.listdir(md_dir) if f.endswith(".md")])
     raw_pages = sorted([f for f in os.listdir(raw_dir) if f.startswith("page_") and f.endswith(".json")])
 
+    # 0. --force：清空历史抓取产物，全新完整抓取（旧章节文件若保留会与新内容叠加造成重复导出）
+    if force:
+        removed = clear_crawl_artifacts(book_dir)
+        print(f"🧹 --force 模式：已清空历史抓取数据（{removed} 个文件，保留 meta/封面），开始全新抓取...\n")
+        state = get_crawl_state(book_dir)
+        existing_mds = []
+        raw_pages = []
+
     # 1. 自愈检查：若存在 raw 页面落盘但 chapters 为空，自动重构
     if not existing_mds and raw_pages:
         print(f"🔄 检测到存在历史逐页落盘数据 ({len(raw_pages)} 页)，正在恢复章节数据...")
@@ -530,11 +587,36 @@ async def main(book_id_or_url, force=False):
 
     # 2. 全书已完成抓取且未指定 --force 时，直接复用已有数据
     if state.get("completed") and existing_mds and not force:
-        print(f"📖 检测到书籍《{book_id}》此前已完整抓取（共 {len(existing_mds)} 章）。")
-        print("⏩ 自动跳过重复抓取，直接复用已有数据进入后续多格式导出流程。")
-        print("💡 如需强制重新完整抓取，可在命令行传入 --force 参数。\n")
-        download_all_images(raw_dir, img_dir)
-        return True
+        completed_t, partial_t = load_chapter_titles(raw_dir)
+        if partial_t:
+            print(f"⚠️ 检测到上次抓取在章节《{partial_t[-1]}》中途终止，该章内容可能不完整。")
+            print("   为保证内容完整，将清空历史数据后重新完整抓取...\n")
+            clear_crawl_artifacts(book_dir)
+            state = get_crawl_state(book_dir)
+            existing_mds = []
+            raw_pages = []
+        else:
+            # 旧版本数据完整性提示：末章标题若无法在目录中定位，可能是被提前截断的旧抓取
+            suspect = ""
+            cat_path = os.path.join(book_dir, "_catalog.json")
+            if os.path.isfile(cat_path):
+                try:
+                    with open(cat_path, encoding="utf-8") as f:
+                        cat_disk = json.load(f)
+                    if completed_t:
+                        last_norm = norm(completed_t[-1])
+                        if not any(last_norm == norm(c) or last_norm.startswith(norm(c)) for c in cat_disk):
+                            suspect = completed_t[-1]
+                except Exception:
+                    pass
+            print(f"📖 检测到书籍《{book_id}》此前已完整抓取（共 {len(existing_mds)} 章）。")
+            if suspect:
+                print(f"⚠️ 注意：末章《{suspect}》未出现在官方目录中，旧版本抓取可能在章节中途被提前终止；")
+                print("   如怀疑导出内容不完整，请用 --force（或 GUI 勾选“强制重新抓取”）重新抓取核验。")
+            print("⏩ 自动跳过重复抓取，直接复用已有数据进入后续多格式导出流程。")
+            print("💡 如需强制重新完整抓取，可在命令行传入 --force 参数。\n")
+            download_all_images(raw_dir, img_dir)
+            return True
 
     print(f"📖 目标书籍 ID: {book_id}")
 
@@ -611,26 +693,24 @@ async def main(book_id_or_url, force=False):
         for i in range(n):
             txt = (await items.nth(i).inner_text()).strip().replace("\n", " ")
             txt = re.sub(r"\s*当前读到.*$", "", txt).strip()
+            txt = re.sub(r"\s*\+\d*书签.*$", "", txt).strip()  # 去掉目录 UI 的“+N书签”计数后缀
             if txt:
                 catalog.append(txt)
         with open(os.path.join(book_dir, "_catalog.json"), "w", encoding="utf-8") as f:
             json.dump(catalog, f, ensure_ascii=False, indent=2)
         print(f"📑 目录共 {n} 项: {catalog[:3]} ... {catalog[-2:] if n > 3 else ''}", flush=True)
 
-        # 断点续传智能计算：匹配已完成的章节
-        existing_chap_files = sorted([f for f in os.listdir(raw_dir) if f.startswith("chap_") and f.endswith(".json")])
-        completed_titles = []
-        for cf in existing_chap_files:
-            try:
-                with open(os.path.join(raw_dir, cf), encoding="utf-8") as f:
-                    cdata = json.load(f)
-                    if cdata.get("title"):
-                        completed_titles.append(cdata["title"])
-            except Exception:
-                pass
+        # 断点续传智能计算：匹配已完成的章节（上次中途终止时“末章落盘”的部分章节不计入）
+        completed_titles, partial_titles = load_chapter_titles(raw_dir)
+        if partial_titles:
+            print(f"⚠️ 检测到上次抓取在章节《{partial_titles[-1]}》中途终止，该章内容不完整。")
+            print("   为保证内容完整，将清空历史数据后重新完整抓取...")
+            clear_crawl_artifacts(book_dir)
+            completed_titles, partial_titles = [], []
+            state = get_crawl_state(book_dir)
 
         resume_cat_idx = 0
-        if completed_titles and catalog:
+        if completed_titles and catalog and n > 0:
             last_done_norm = norm(completed_titles[-1])
             for ci, cat in enumerate(catalog):
                 if norm(cat) == last_done_norm or last_done_norm.startswith(norm(cat)):
@@ -647,6 +727,14 @@ async def main(book_id_or_url, force=False):
                 await ctx.close()
                 download_all_images(raw_dir, img_dir)
                 return True
+            if resume_cat_idx == 0:
+                # 最后落盘章节无法在官方目录中定位：断点位置不可信，
+                # 清空后全新抓取，避免章节重复或遗漏
+                print("⚠️ 已落盘章节与官方目录无法对齐（上次可能在章节中途被截断）。")
+                print("   为保证内容完整，将清空历史数据后重新完整抓取...")
+                clear_crawl_artifacts(book_dir)
+                completed_titles = []
+                state = get_crawl_state(book_dir)
 
         if resume_cat_idx > 0 and n > 0:
             print("\n" + "="*55)
@@ -654,12 +742,32 @@ async def main(book_id_or_url, force=False):
             print(f"   - 历史已完成: {len(completed_titles)} 卷/章 (已落盘至 chapters/ 目录)")
             print(f"   - 续跑跳转点: 目录第 {resume_cat_idx + 1}/{n} 项《{catalog[resume_cat_idx]}》")
             print("="*55 + "\n", flush=True)
+            # 清理“中断时正在进行中”章节的残留逐页数据：该章会从章首重抓，
+            # 残留页若保留，日后触发自愈重构时会与新内容拼接出重复段落
+            ip_title = catalog[resume_cat_idx]
+            ip_norm = norm(ip_title)
+            removed = 0
+            for pf in sorted(os.listdir(raw_dir)):
+                if not (pf.startswith("page_") and pf.endswith(".json")):
+                    continue
+                try:
+                    with open(os.path.join(raw_dir, pf), encoding="utf-8") as f:
+                        if norm(json.load(f).get("chapter") or "") == ip_norm:
+                            os.remove(os.path.join(raw_dir, pf))
+                            removed += 1
+                except Exception:
+                    continue
+            if removed:
+                print(f"🧹 已清理章节《{ip_title}》的 {removed} 页中断残留，将从章首重新抓取", flush=True)
             nav_idx = min(resume_cat_idx, n - 1)
         else:
             nav_idx = 0
 
         # 平稳导航至目标章节（首章或续跑断点）
         if n > 0:
+            # 先清空捕获缓冲：丢弃导航前残留渲染（上次阅读位置/切换双栏中间态），
+            # 确保第一章从目标章节首页开始，避免脏数据混入
+            await page.evaluate("() => window.__wr_drain()")
             it = items.nth(nav_idx)
             await it.scroll_into_view_if_needed()
             await asyncio.sleep(0.3)
@@ -672,7 +780,7 @@ async def main(book_id_or_url, force=False):
                 await page.keyboard.press("Escape")
             await asyncio.sleep(1.0)
 
-        # 等待首屏渲染稳定后再清空/重置缓冲区，确保首页 100% 捕获
+        # 等待目标章节首页渲染稳定，确保首页 100% 捕获
         await wait_stable_chars(page, timeout=5.0)
 
         cur_title = catalog[nav_idx] if catalog and nav_idx < len(catalog) else "扉页"
@@ -681,7 +789,6 @@ async def main(book_id_or_url, force=False):
         buf = []
         stale = 0
         seen_last = False
-        last_after_seen = 0
         last_cat = norm(catalog[-1]) if catalog else ""
         seen_page_sigs = set()
         seen_imgs = set()
@@ -693,6 +800,7 @@ async def main(book_id_or_url, force=False):
         long_pause_at = next_long_pause_at(start_step)
 
         print(f"\n🚀 开始遍历抓取页面 (从第 {start_step} 页开始)...", flush=True)
+        end_by_stale = False   # 是否为“翻页连续无新内容”的正常完结
 
         for step in range(start_step, start_step + 5000):
             if step > start_step:
@@ -705,6 +813,11 @@ async def main(book_id_or_url, force=False):
                     print(f"  ⏸ 已抓取 {step} 页，触发温和长停顿 {pause:.0f} 秒...", flush=True)
                     await asyncio.sleep(pause)
                     long_pause_at = next_long_pause_at(step)
+
+                # 定期复查登录态：掉登录时如实终止，避免空转后被误判为“全书完成”
+                if step % LOGIN_CHECK_EVERY == 0 and not await check_cookies_login(ctx):
+                    print("❌ 抓取过程中登录态失效，已如实终止（已完成章节均已落盘，重新运行可断点续传）。", flush=True)
+                    break
 
             ok = await wait_stable_chars(page, timeout=2.2 if step > start_step else 5.0)
             chars = await page.evaluate("() => window.__wr_drain()") if ok else []
@@ -769,6 +882,8 @@ async def main(book_id_or_url, force=False):
                         seen_titles.add(cur_title)
                         print(f"\n  📑 [第 {step:03d} 页] 识别新章节: 《{cur_title}》", flush=True)
                         if last_cat and norm(cur_title) == last_cat:
+                            if not seen_last:
+                                print(f"  ℹ 已进入目录末章《{cur_title}》，继续抓取直到翻页无新内容为止（不提前终止）", flush=True)
                             seen_last = True
 
                         if remainder:
@@ -822,18 +937,13 @@ async def main(book_id_or_url, force=False):
             if got_any:
                 stale = 0
                 print(f"  [进度 第 {step:03d} 页] 本页 +{step_words:3d} 字 | 累计 {total_words_accum:6d} 字 | 所在: 《{cur_title[:12]}》 | 已用时 {elapsed_str}", flush=True)
-                if seen_last:
-                    last_after_seen += 1
-                    if last_after_seen >= 4:
-                        print("  🏁 末章内容已抓取完成", flush=True)
-                        break
             else:
                 stale += 1
-                if seen_last and stale >= 2:
-                    print("  🏁 已到达末章且无新内容，抓取完成", flush=True)
-                    break
-                if stale >= 8:
+                if stale == 3:
+                    print("  ⚠ 连续 3 页无新内容：若浏览器出现弹窗/验证/网络异常请手动处理，任务会继续尝试...", flush=True)
+                if stale >= STALE_LIMIT:
                     print(f"  🏁 连续 {stale} 页无新内容，判定全书抓取结束", flush=True)
+                    end_by_stale = True
                     break
 
         if cur_title and buf:
@@ -842,13 +952,17 @@ async def main(book_id_or_url, force=False):
             txt_len = len(re.sub(r"<[^>]+>", "", body))
             with open(os.path.join(md_dir, "%04d.md" % saved_idx), "w", encoding="utf-8") as f:
                 f.write(body)
+            # 非正常完结（弹窗/掉登录/页数上限）时落盘的末章可能不完整，标记 partial，
+            # 下次运行会清空重抓该章，避免残缺内容被当作已完成章节复用
+            is_partial = not end_by_stale
             with open(os.path.join(raw_dir, "chap_%04d.json" % saved_idx), "w", encoding="utf-8") as f:
-                json.dump({"title": cur_title, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
-            print(f"\n  💾 [末章落盘] [{saved_idx:02d}] 《{cur_title}》已写入 chapters/{saved_idx:04d}.md ({txt_len} 字)", flush=True)
+                json.dump({"title": cur_title, "images": im_list, "text_len": txt_len, "partial": is_partial}, f, ensure_ascii=False)
+            print(f"\n  💾 [末章落盘] [{saved_idx:02d}] 《{cur_title}》已写入 chapters/{saved_idx:04d}.md ({txt_len} 字)"
+                  + ("（中途终止，该章可能不完整，续抓时将自动重抓）" if is_partial else ""), flush=True)
 
         save_crawl_state(book_dir, {
             "book_id": book_id,
-            "completed": True,
+            "completed": end_by_stale,
             "last_step": step,
             "saved_chapter_count": saved_idx,
             "last_title": cur_title,
@@ -857,13 +971,17 @@ async def main(book_id_or_url, force=False):
         })
 
         print(f"\n" + "="*50)
-        print(f"🎉 抓取成功！全书已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
+        if end_by_stale:
+            print(f"🎉 抓取成功！全书已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
+        else:
+            print(f"⚠️ 抓取未正常完结（弹窗/登录失效/页数上限），已保存 {saved_idx} 个章节后停止。")
+            print("   已完成内容均已落盘；重新运行可断点续传，正常完结后才会标记为已完成。")
         print("="*50)
         await ctx.close()
 
     # 统一补齐配图下载
     download_all_images(raw_dir, img_dir)
-    return True
+    return end_by_stale
 
 
 if __name__ == "__main__":

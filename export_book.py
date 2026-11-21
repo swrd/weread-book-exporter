@@ -114,6 +114,58 @@ def refine_chapter_text(text):
     return res
 
 
+def validate_book(root, texts):
+    """导出前完整性校验（非阻塞，仅告警）：抓取状态 + 目录覆盖率"""
+    state_path = os.path.join(root, "_state.json")
+    st = {}
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            st = {}
+    if st and not st.get("completed"):
+        print("\n" + "!" * 58)
+        print("⚠️ 警告：该书上次抓取未正常完结，导出内容可能存在遗漏！")
+        print("   建议先重新运行抓取（GUI 勾选“强制重新抓取”，或 crawl_weread.py --force）再导出。")
+        print("!" * 58 + "\n", flush=True)
+
+    catalog_path = os.path.join(root, "_catalog.json")
+    if not os.path.isfile(catalog_path):
+        return
+    try:
+        with open(catalog_path, encoding="utf-8") as f:
+            catalog = json.load(f)
+    except Exception:
+        return
+    if not catalog:
+        return
+
+    def _norm(s):
+        return re.sub(r"[\s\u200b\ufeff\u3000\-_:：,，、.·]+", "", s or "")
+
+    covered = set()
+    for t in texts:
+        first = t.split("\n", 1)[0]
+        m = re.match(r"^#\s*(.+)$", first)
+        if m:
+            covered.add(_norm(m.group(1)))
+
+    missing = []
+    for cat in catalog:
+        cat_clean = re.sub(r"\s*\+\d*书签.*$", "", cat)  # 目录 UI 的“+N书签”计数后缀
+        ncat = _norm(cat_clean)
+        if ncat and ncat not in covered:
+            missing.append(cat_clean)
+    if missing:
+        print(f"⚠️ 目录覆盖率检查：{len(missing)} 个目录条目未匹配到对应章节。", flush=True)
+        print("   （“文前”等条目可能对应扉页/版权页属正常；若为正文章节则说明可能存在遗漏，建议 --force 重抓核验）", flush=True)
+        for m in missing[:10]:
+            print(f"   - {m}", flush=True)
+        if len(missing) > 10:
+            print(f"   ... 等共 {len(missing)} 项", flush=True)
+
+
 def read_book(book_id):
     root = os.path.join(BASE, "output", book_id + "_v2")
     ch_dir = os.path.join(root, "chapters")
@@ -453,6 +505,9 @@ async def main(book_id_or_url):
     if not texts:
         print(f"❌ 错误: 未找到该书籍已抓取的章节文件，请先运行抓取！(路径: output/{book_id}_v2/chapters/)")
         return False
+
+    # 导出前完整性校验：抓取状态 + 目录覆盖率（仅告警，不阻塞）
+    validate_book(root, texts)
 
     meta_path = os.path.join(root, "meta.json")
     title = f"Book_{book_id}"
